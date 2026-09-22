@@ -106,12 +106,19 @@ class _CalendarPageState extends State<CalendarPage> {
           ),
         ),
         child: SafeArea(
-          child: RefreshIndicator(
-            onRefresh: _refresh,
-            child: ListView(
-              padding: const EdgeInsets.fromLTRB(20, 24, 20, 40),
-              children: _buildBody(),
-            ),
+          // Cupertino pull-to-refresh: CustomScrollView + slivers.
+          // RefreshIndicator is a Material widget and this app imports only
+          // package:flutter/cupertino.dart, so it would not compile.
+          child: CustomScrollView(
+            slivers: [
+              CupertinoSliverRefreshControl(onRefresh: _refresh),
+              SliverPadding(
+                padding: const EdgeInsets.fromLTRB(20, 24, 20, 40),
+                sliver: SliverList(
+                  delegate: SliverChildListDelegate(_buildBody()),
+                ),
+              ),
+            ],
           ),
         ),
       ),
