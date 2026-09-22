@@ -59,7 +59,7 @@ class _CalendarPageState extends State<CalendarPage> {
 
   Future<void> _bootstrap() async {
     final prefs = await SharedPreferences.getInstance();
-    final id = prefs.getString('vector.user_id') ?? 'local';
+    final id = prefs.getString('vector.user_id') ?? Api.defaultUserId;
     _api = Api(userId: id);
     await _refresh();
   }
