@@ -320,14 +320,24 @@ class _CalendarPageState extends State<CalendarPage> {
       if (!mounted) return;
       final back = <_Exchange>[];
       for (final m in h) {
-        final ins =
-            (m['instruction'] ?? m['input'] ?? m['text'] ?? '').toString();
-        final rep =
-            (m['reply'] ?? m['output'] ?? m['result'] ?? '').toString();
-        if (ins.isEmpty && rep.isEmpty) continue;
+        // GET /commands returns {id, role, content, created_at}. Reading
+        // instruction/reply instead meant every entry was skipped as empty, so
+        // the history appeared to be permanently blank.
+        final role = (m['role'] ?? '').toString();
+        final content = (m['content'] ??
+                m['instruction'] ??
+                m['reply'] ??
+                m['input'] ??
+                m['output'] ??
+                m['text'] ??
+                m['result'] ??
+                '')
+            .toString();
+        if (content.isEmpty) continue;
+        final isUser = role == 'user';
         back.add(_Exchange(
-            instruction: ins.isEmpty ? '(earlier)' : ins,
-            reply: rep.isEmpty ? '(no reply shown)' : rep,
+            instruction: isUser ? content : '(earlier)',
+            reply: isUser ? '(no reply shown)' : content,
             problems: const <String>[]));
         if (back.length >= 5) break;
       }
