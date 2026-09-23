@@ -10,7 +10,14 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'api_client.dart';
 
-void main() => runApp(const VectorCalendarApp());
+void main() {
+  // In release builds a widget whose build() throws is replaced by a
+  // blank ErrorWidget that prints nothing, so the screen just goes white
+  // and the device reports no reason. Surface it instead.
+  ErrorWidget.builder =
+      (FlutterErrorDetails d) => _CrashReport(d);
+  runApp(const VectorCalendarApp());
+}
 
 class C {
   static const bg = Color(0xFFF5F5F7);
@@ -323,4 +330,35 @@ class _CalendarPageState extends State<CalendarPage> {
         ),
         child: child,
       );
+}
+
+
+/// Shown instead of Flutter's default ErrorWidget when a widget's build throws.
+///
+/// In release builds that default is a blank grey box that prints nothing, so a
+/// crash looks exactly like a hung request. This renders the message and stack
+/// on screen, which is the only way a failure on a real device is reportable.
+class _CrashReport extends StatelessWidget {
+  const _CrashReport(this.details);
+
+  final FlutterErrorDetails details;
+
+  @override
+  Widget build(BuildContext context) {
+    final msg = details.exception.toString();
+    final stack = details.stack?.toString() ?? '';
+    return Directionality(
+      textDirection: TextDirection.ltr,
+      child: Container(
+        color: const Color(0xFF111827),
+        padding: const EdgeInsets.all(14),
+        child: SingleChildScrollView(
+          child: Text(
+            'VECTOR crashed\n\n$msg\n\n$stack',
+            style: const TextStyle(color: Color(0xFFF9FAFB), fontSize: 11),
+          ),
+        ),
+      ),
+    );
+  }
 }
