@@ -80,11 +80,24 @@ class _CalendarPageState extends State<CalendarPage> {
       final t = await api.today();
       if (!mounted) return;
       setState(() {
-        _startable = ((t['startable'] as List?) ?? [])
-            .cast<Map<String, dynamic>>();
-        _done = ((t['done_today'] as List?) ?? [])
-            .cast<Map<String, dynamic>>();
-        _focusMinutes = (t['focus_minutes'] as num?)?.toInt() ?? 0;
+        // `is` checks, not `as` casts: a wrong-typed value degrades to the
+        // default instead of throwing inside setState and blanking the day.
+        final rawStartable = t['startable'];
+        _startable = rawStartable is List
+            ? rawStartable
+                .whereType<Map>()
+                .map((m) => Map<String, dynamic>.from(m))
+                .toList()
+            : <Map<String, dynamic>>[];
+        final rawDone = t['done_today'];
+        _done = rawDone is List
+            ? rawDone
+                .whereType<Map>()
+                .map((m) => Map<String, dynamic>.from(m))
+                .toList()
+            : <Map<String, dynamic>>[];
+        _focusMinutes =
+            t['focus_minutes'] is num ? (t['focus_minutes'] as num).toInt() : 0;
         _loading = false;
       });
     } on ApiException catch (e) {
@@ -102,8 +115,8 @@ class _CalendarPageState extends State<CalendarPage> {
     }
   }
 
-  int get _plannedMinutes => _startable
-      .fold(0, (s, t) => s + ((t['minutes'] as num?)?.toInt() ?? 0));
+  int get _plannedMinutes => _startable.fold(
+      0, (s, t) => s + (t['minutes'] is num ? (t['minutes'] as num).toInt() : 0));
 
   @override
   Widget build(BuildContext context) {
