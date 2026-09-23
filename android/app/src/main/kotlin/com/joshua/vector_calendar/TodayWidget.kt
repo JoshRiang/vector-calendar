@@ -34,7 +34,32 @@ class TodayWidget : AppWidgetProvider() {
             views.setTextViewText(R.id.widget_primary,
                 context.getString(R.string.widget_loading))
             mgr.updateAppWidget(id, views)
-            thread { refresh(context, mgr, id) }
+            // The fetch runs in onReceive under goAsync(): a thread started
+            // here can be killed the moment onUpdate returns, which made
+            // every fetch fail and the widget show "Server unreachable".
+        }
+    }
+
+
+    /**
+     * The fetch runs here, not in onUpdate, so that goAsync() can hold the
+     * broadcast open. A thread started from onUpdate is killed with the process
+     * as soon as onUpdate returns, which made the request die and the widget
+     * report "Server unreachable" while the server was healthy.
+     */
+    override fun onReceive(context: Context, intent: Intent) {
+        super.onReceive(context, intent)
+        if (intent.action != AppWidgetManager.ACTION_APPWIDGET_UPDATE) return
+        val pending = goAsync()
+        val mgr = AppWidgetManager.getInstance(context)
+        val ids = mgr.getAppWidgetIds(
+            android.content.ComponentName(context, javaClass))
+        thread {
+            try {
+                for (id in ids) refresh(context, mgr, id)
+            } finally {
+                pending.finish()
+            }
         }
     }
 
@@ -132,6 +157,27 @@ class TodayWidget : AppWidgetProvider() {
     /** Group digits so a 7-figure amount stays readable in a narrow widget. */
     private fun fmt(v: Double): String = String.format("%,.0f", v)
 
+    /**
+     * Endpoints tried in order, after the configured one.
+     *
+     * The public URL is the only endpoint that works away from home, but it can
+     * be unreachable while a private address still answers -- Tailscale DNS up
+     * with the tunnel down, a captive portal, a slow cold start. The app has
+     * this failover and works; the widget did not, which is why the app
+     * recovered while the widget kept reporting "Server unreachable".
+     */
+    private val FALLBACK_BASES = listOf(
+        "http://10.11.11.235:8790",
+        "http://100.89.180.23:8790",
+    )
+
+    private fun candidateBases(context: Context): List<String> {
+        val primary = context.getString(R.string.vector_api_base).trimEnd('/')
+        return (listOf(primary) + FALLBACK_BASES)
+            .map { it.trimEnd('/') }
+            .distinct()
+    }
+
     private fun httpGet(context: Context, path: String): String =
         http(context, "GET", path, null)
 
@@ -139,18 +185,37 @@ class TodayWidget : AppWidgetProvider() {
         http(context, "POST", path, "{}")
 
     /**
-     * Single HTTP entry point. A widget provider runs on the main thread, so
-     * every caller is responsible for being off it.
+     * HTTP entry point with endpoint failover. A widget provider runs on the
+     * main thread, so every caller is responsible for being off it.
+     *
+     * Only a transport failure (IOException) moves on to the next endpoint: if
+     * the server answered at all, another address would answer the same way.
      */
     private fun http(context: Context, method: String, path: String,
                      body: String?): String {
-        val base = context.getString(R.string.vector_api_base).trimEnd('/')
+        var lastError: java.io.IOException? = null
+        for (base in candidateBases(context)) {
+            try {
+                return httpOnce(context, base, method, path, body)
+            } catch (e: java.io.IOException) {
+                lastError = e
+            }
+        }
+        throw java.io.IOException(
+            "no VECTOR endpoint reachable: " + (lastError?.message ?: "unknown"))
+    }
+
+    /** One request against one base. */
+    private fun httpOnce(context: Context, base: String, method: String,
+                         path: String, body: String?): String {
         val userId = context.getString(R.string.vector_user_id)
         val key = context.getString(R.string.vector_api_key)
         val conn = (URL(base + path).openConnection() as HttpURLConnection).apply {
             requestMethod = method
-            connectTimeout = 8000
-            readTimeout = 8000
+            // 5s, not 8s: an appwidget update is time-limited, and a dead
+            // private address must not eat the budget before the live one.
+            connectTimeout = 5000
+            readTimeout = 5000
             setRequestProperty("X-User-Id", userId)
             setRequestProperty("Accept", "application/json")
             if (key.isNotEmpty()) setRequestProperty("X-Api-Key", key)
@@ -168,6 +233,38 @@ class TodayWidget : AppWidgetProvider() {
             return stream?.bufferedReader()?.use { it.readText() } ?: ""
         } finally {
             conn.disconnect()
+        }
+    }
+
+    /**
+     * Report a widget event to the server.
+     *
+     * The widget shows "Server unreachable" for every exception it catches,
+     * which hides a code bug behind a network diagnosis. Beaconing the real
+     * exception is the only way to tell the two apart on a device. Runs
+     * SYNCHRONOUSLY: every caller is already off the main thread, and a nested
+     * thread could outlive goAsync()'s finisher and be killed before sending.
+     */
+    private fun beacon(context: Context, stage: String, detail: String) {
+        try {
+            val base = context.getString(R.string.vector_api_base).trimEnd('/')
+            val url = java.net.URL(base + "/diag?stage=" +
+                java.net.URLEncoder.encode(stage, "UTF-8") + "&detail=" +
+                java.net.URLEncoder.encode(detail.take(500), "UTF-8"))
+            val conn = (url.openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                connectTimeout = 4000
+                readTimeout = 4000
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json")
+                setRequestProperty("X-User-Id",
+                    context.getString(R.string.vector_user_id))
+            }
+            conn.outputStream.use { it.write("{}".toByteArray()) }
+            conn.responseCode
+            conn.disconnect()
+        } catch (e: Exception) {
+            // Never let the diagnostic become the failure.
         }
     }
 

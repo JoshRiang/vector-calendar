@@ -10,11 +10,56 @@ library;
 
 import 'dart:convert';
 import 'dart:async' show TimeoutException;
-import 'dart:io' show HandshakeException, SocketException;
+import 'dart:io' show HandshakeException, HttpClient, SocketException;
 
 import 'package:http/http.dart' as http;
 
 class Api {
+  /// Report a startup stage to the server so a device that cannot render can
+  /// still say WHERE it stopped.
+  ///
+  /// This deliberately does NOT use _send: the whole point is to work when the
+  /// normal request path is what is failing. It is fire-and-forget with short
+  /// timeouts, it tries every candidate endpoint, and it never throws into the
+  /// caller -- a failed diagnostic must not be a second failure.
+  static void beacon(String stage, [String detail = '']) {
+    Future<void>(() async {
+      final bases = <String>[
+        defaultBaseUrl,
+        for (final u in _fallbacks.split(','))
+          if (u.trim().isNotEmpty && u.trim() != defaultBaseUrl) u.trim(),
+      ];
+      final body = jsonEncode({'stage': stage, 'detail': detail});
+      for (final b in bases) {
+        try {
+          final client = HttpClient()
+            ..connectionTimeout = const Duration(seconds: 4);
+          // The stage travels in the QUERY STRING, not only the body.
+          //
+          // The first version posted JSON only, and the server logged the
+          // beacons as "stage=?" with an empty body - the stage was lost in
+          // transport. A URL survives a broken body, so the payload goes in
+          // both places and the server reads whichever arrives.
+          final uri = Uri.parse('$b/diag').replace(queryParameters: {
+            'stage': stage,
+            'detail': detail.length > 500 ? detail.substring(0, 500) : detail,
+          });
+          final req = await client
+              .postUrl(uri)
+              .timeout(const Duration(seconds: 4));
+          req.headers.set('Content-Type', 'application/json');
+          req.headers.set('X-User-Id', defaultUserId);
+          req.write(body);
+          await req.close().timeout(const Duration(seconds: 4));
+          client.close();
+          return;
+        } catch (_) {
+          // Try the next endpoint; a beacon that throws would mask the real bug.
+        }
+      }
+    });
+  }
+
   Api({String? baseUrl, required this.userId, String? apiKey, http.Client? client})
       : baseUrl = baseUrl ?? defaultBaseUrl,
         apiKey = apiKey ?? defaultApiKey,
