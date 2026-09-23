@@ -1,8 +1,9 @@
-/// VECTOR Calendar — today's plan, in order.
+// ignore_for_file: use_build_context_synchronously
+/// VECTOR Calendar — a Google Calendar-like month + day view.
 ///
-/// Shows the day assembled from what is actually startable, plus what got done
-/// and how much focus time was logged. Deliberately NOT a month grid: a month
-/// view is another place to feel behind. The unit of work here is today.
+/// Month grid with dots for busy days, a swipeable day agenda (all-day items
+/// pinned at the top), a create/edit page, and a Hermes command bar.
+/// Cupertino-only: no Material widgets, pull-to-refresh via slivers.
 library;
 
 import 'package:flutter/cupertino.dart';
@@ -14,20 +15,128 @@ void main() {
   // In release builds a widget whose build() throws is replaced by a
   // blank ErrorWidget that prints nothing, so the screen just goes white
   // and the device reports no reason. Surface it instead.
-  ErrorWidget.builder =
-      (FlutterErrorDetails d) => _CrashReport(d);
+  ErrorWidget.builder = (FlutterErrorDetails d) => _CrashReport(d);
   runApp(const VectorCalendarApp());
 }
 
-class C {
-  static const bg = Color(0xFFF5F5F7);
+/// Design language carried over from the existing app: frosted glass cards,
+/// generous spacing, large bold headings, gradient background.
+class AppColors {
+  static const bgBase = Color(0xFFF5F5F7);
   static const bgTop = Color(0xFFEEF1FF);
   static const glass = Color(0xCCFFFFFF);
   static const accent = Color(0xFF6366F1);
+  static const accentSoft = Color(0xFF8B5CF6);
   static const success = Color(0xFF10B981);
+  static const danger = Color(0xFFEF4444);
+  static const warning = Color(0xFFF59E0B);
   static const textPrimary = Color(0xFF1C1C1E);
   static const textSecondary = Color(0xFF6B7280);
   static const textTertiary = Color(0xFF9CA3AF);
+}
+
+// ---------------------------------------------------------------------------
+// Date + item helpers (pure, so they cannot throw inside build).
+// ---------------------------------------------------------------------------
+
+String _two(int n) => n.toString().padLeft(2, '0');
+
+/// 'YYYY-MM-DD' key used to group items per day.
+String dayKey(DateTime d) =>
+    '${d.year.toString().padLeft(4, '0')}-${_two(d.month)}-${_two(d.day)}';
+
+DateTime dateOnly(DateTime d) => DateTime(d.year, d.month, d.day);
+
+DateTime addDays(DateTime d, int n) => DateTime(d.year, d.month, d.day + n);
+
+int daysInMonth(int year, int month) => DateTime(year, month + 1, 0).day;
+
+String monthName(int m) {
+  const names = [
+    'January', 'February', 'March', 'April', 'May', 'June', 'July',
+    'August', 'September', 'October', 'November', 'December',
+  ];
+  if (m < 1 || m > 12) return '';
+  return names[m - 1];
+}
+
+String weekdayName(int w) {
+  const names = [
+    'Monday', 'Tuesday', 'Wednesday', 'Thursday',
+    'Friday', 'Saturday', 'Sunday',
+  ];
+  if (w < 1 || w > 7) return '';
+  return names[w - 1];
+}
+
+/// Parse `scheduled_at` ('YYYY-MM-DDTHH:MM:SS'); null when absent or bad.
+DateTime? parseWhen(Map<String, dynamic> item) {
+  final v = item['scheduled_at'];
+  if (v is String && v.isNotEmpty) return DateTime.tryParse(v);
+  return null;
+}
+
+/// all_day arrives as int 0/1 (or bool); anything else means timed.
+bool itemIsAllDay(Map<String, dynamic> item) {
+  final v = item['all_day'];
+  if (v is num) return v.toInt() == 1;
+  if (v is bool) return v;
+  return false;
+}
+
+int itemMinutes(Map<String, dynamic> item) =>
+    Safe.number(item['minutes'])?.toInt() ?? 30;
+
+String itemTitle(Map<String, dynamic> item) =>
+    (item['title'] ?? '').toString();
+
+bool itemIsDone(Map<String, dynamic> item) =>
+    (item['status'] ?? '').toString() == 'done';
+
+/// Day key for grouping; '' when the item has no usable date (inbox work).
+String itemDateKey(Map<String, dynamic> item) {
+  final w = parseWhen(item);
+  if (w == null) return '';
+  return dayKey(w);
+}
+
+String itemTimeLabel(Map<String, dynamic> item) {
+  if (itemIsAllDay(item)) return 'All day';
+  final w = parseWhen(item);
+  if (w == null) return 'No time';
+  return '${_two(w.hour)}:${_two(w.minute)}';
+}
+
+int _timeSortKey(Map<String, dynamic> item) {
+  final w = parseWhen(item);
+  if (w == null) return 24 * 60 + 1;
+  return w.hour * 60 + w.minute;
+}
+
+/// All-day items first, then by start time, then by title.
+List<Map<String, dynamic>> sortDayItems(List<Map<String, dynamic>> items) {
+  final list = items.toList();
+  list.sort((a, b) {
+    final aAll = itemIsAllDay(a);
+    final bAll = itemIsAllDay(b);
+    if (aAll != bAll) return aAll ? -1 : 1;
+    final ta = _timeSortKey(a);
+    final tb = _timeSortKey(b);
+    if (ta != tb) return ta.compareTo(tb);
+    return itemTitle(a).compareTo(itemTitle(b));
+  });
+  return list;
+}
+
+Map<String, List<Map<String, dynamic>>> groupByDay(
+    List<Map<String, dynamic>> items) {
+  final map = <String, List<Map<String, dynamic>>>{};
+  for (final it in items) {
+    final k = itemDateKey(it);
+    if (k.isEmpty) continue;
+    map.putIfAbsent(k, () => <Map<String, dynamic>>[]).add(it);
+  }
+  return map;
 }
 
 class VectorCalendarApp extends StatelessWidget {
@@ -38,9 +147,22 @@ class VectorCalendarApp extends StatelessWidget {
         title: 'Vector Calendar',
         debugShowCheckedModeBanner: false,
         theme: CupertinoThemeData(
-            primaryColor: C.accent, scaffoldBackgroundColor: C.bg),
+            primaryColor: AppColors.accent,
+            scaffoldBackgroundColor: AppColors.bgBase),
         home: CalendarPage(),
       );
+}
+
+/// One command-bar exchange, kept visible so the user sees what changed.
+class _Exchange {
+  const _Exchange(
+      {required this.instruction,
+      required this.reply,
+      required this.problems});
+
+  final String instruction;
+  final String reply;
+  final List<String> problems;
 }
 
 class CalendarPage extends StatefulWidget {
@@ -51,20 +173,51 @@ class CalendarPage extends StatefulWidget {
 }
 
 class _CalendarPageState extends State<CalendarPage> {
+  // Plain fields with single assignment in initState/bootstrap.
+  // (Deliberately NOT late final: a repeated load must never throw
+  // LateInitializationError and strand the screen.)
   Api? _api;
+  late DateTime _baseDate;
+  late DateTime _selected;
+  late DateTime _monthStart;
+  PageController? _dayPager;
+
+  static const int _pageCount = 731;
+  static const int _basePage = 365;
+
   bool _loading = true;
+  bool _loadingMonth = false;
   String? _error;
-  List<Map<String, dynamic>> _startable = [];
-  List<Map<String, dynamic>> _done = [];
-  int _focusMinutes = 0;
+  String? _notice;
+  Map<String, List<Map<String, dynamic>>> _byDay = {};
+  Map<String, int> _dayCounts = {};
+  List<Map<String, dynamic>> _inbox = [];
+
+  final TextEditingController _cmd = TextEditingController();
+  bool _sending = false;
+  String? _cmdError;
+  final List<_Exchange> _history = [];
 
   @override
   void initState() {
     super.initState();
+    final now = DateTime.now();
+    _baseDate = dateOnly(now);
+    _selected = dateOnly(now);
+    _monthStart = DateTime(now.year, now.month, 1);
+    _dayPager = PageController(initialPage: _basePage);
     Future.microtask(_bootstrap);
   }
 
+  @override
+  void dispose() {
+    _cmd.dispose();
+    _dayPager?.dispose();
+    super.dispose();
+  }
+
   Future<void> _bootstrap() async {
+    Api.beacon('calendar_start');
     String id = Api.defaultUserId;
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -73,78 +226,395 @@ class _CalendarPageState extends State<CalendarPage> {
       // Prefs failure must not strand the app on a blank screen.
     }
     _api = Api(userId: id);
-    await _refresh();
+    await _loadMonth(_monthStart, spinner: true);
+    await _loadHistory();
   }
 
-  Future<void> _refresh() async {
+  Future<void> _refresh() => _loadMonth(_monthStart);
+
+  Future<void> _loadMonth(DateTime month, {bool spinner = false}) async {
     final api = _api;
     if (api == null) return;
     setState(() {
-      _loading = true;
+      if (spinner) {
+        _loading = true;
+      } else {
+        _loadingMonth = true;
+      }
       _error = null;
     });
     try {
-      final t = await api.today();
+      final first = DateTime(month.year, month.month, 1);
+      final last = DateTime(month.year, month.month + 1, 0);
+      final data = await api.calendarRange(
+          start: dayKey(first), end: dayKey(last));
       if (!mounted) return;
+      final items = Safe.mapList(data['items']);
+      final days = Safe.mapList(data['days']);
+      final grouped = groupByDay(items);
+      final counts = <String, int>{};
+      for (final d in days) {
+        final k = (d['date'] ?? '').toString();
+        if (k.isEmpty) continue;
+        final c = Safe.number(d['count'])?.toInt() ?? 0;
+        if (c > 0) counts[k] = c;
+        // Some backends only nest items under days[]; merge those in so the
+        // agenda and the dots agree.
+        final nested = Safe.mapList(d['items']);
+        for (final it in nested) {
+          grouped.putIfAbsent(k, () => <Map<String, dynamic>>[]).add(it);
+        }
+      }
+      // De-duplicate rows that arrived in both items[] and days[].items.
+      for (final k in grouped.keys.toList()) {
+        final cur = grouped[k];
+        if (cur == null) continue;
+        final seen = <String>{};
+        final out = <Map<String, dynamic>>[];
+        for (final it in cur) {
+          final id = (it['id'] ?? '').toString();
+          if (id.isNotEmpty) {
+            if (seen.contains(id)) continue;
+            seen.add(id);
+          }
+          out.add(it);
+        }
+        grouped[k] = out;
+      }
+      final inbox = <Map<String, dynamic>>[];
+      for (final it in items) {
+        if (itemDateKey(it).isEmpty) inbox.add(it);
+      }
       setState(() {
-        // `is` checks, not `as` casts: a wrong-typed value degrades to the
-        // default instead of throwing inside setState and blanking the day.
-        final rawStartable = t['startable'];
-        _startable = rawStartable is List
-            ? rawStartable
-                .whereType<Map>()
-                .map((m) => Map<String, dynamic>.from(m))
-                .toList()
-            : <Map<String, dynamic>>[];
-        final rawDone = t['done_today'];
-        _done = rawDone is List
-            ? rawDone
-                .whereType<Map>()
-                .map((m) => Map<String, dynamic>.from(m))
-                .toList()
-            : <Map<String, dynamic>>[];
-        _focusMinutes =
-            t['focus_minutes'] is num ? (t['focus_minutes'] as num).toInt() : 0;
+        _byDay = grouped;
+        _dayCounts = counts;
+        _inbox = inbox;
         _loading = false;
+        _loadingMonth = false;
+        _notice = null;
       });
     } on ApiException catch (e) {
       if (!mounted) return;
       setState(() {
         _error = e.message;
         _loading = false;
+        _loadingMonth = false;
       });
     } catch (e) {
       if (!mounted) return;
       setState(() {
         _error = 'Something went wrong: $e';
         _loading = false;
+        _loadingMonth = false;
       });
     }
   }
 
-  int get _plannedMinutes => _startable.fold(
-      0, (s, t) => s + (t['minutes'] is num ? (t['minutes'] as num).toInt() : 0));
+  /// Recent command history so the exchange stays visible across restarts.
+  /// Best-effort: an unknown shape or a failure must never touch the calendar.
+  Future<void> _loadHistory() async {
+    final api = _api;
+    if (api == null) return;
+    try {
+      final h = await api.commandHistory();
+      if (!mounted) return;
+      final back = <_Exchange>[];
+      for (final m in h) {
+        final ins =
+            (m['instruction'] ?? m['input'] ?? m['text'] ?? '').toString();
+        final rep =
+            (m['reply'] ?? m['output'] ?? m['result'] ?? '').toString();
+        if (ins.isEmpty && rep.isEmpty) continue;
+        back.add(_Exchange(
+            instruction: ins.isEmpty ? '(earlier)' : ins,
+            reply: rep.isEmpty ? '(no reply shown)' : rep,
+            problems: const <String>[]));
+        if (back.length >= 5) break;
+      }
+      if (back.isNotEmpty && mounted) {
+        setState(() {
+          for (final e in back) {
+            _history.add(e);
+          }
+        });
+      }
+    } catch (_) {
+      // History is a nicety; ignore.
+    }
+  }
+
+  int get _monthTotal {
+    var n = 0;
+    for (final l in _byDay.values) {
+      n += l.length;
+    }
+    return n;
+  }
+
+  bool _hasDay(String k) {
+    final items = _byDay[k];
+    if (items != null && items.isNotEmpty) return true;
+    return (_dayCounts[k] ?? 0) > 0;
+  }
+
+  // -- navigation ----------------------------------------------------------
+
+  void _jumpPager(DateTime d) {
+    final pager = _dayPager;
+    if (pager == null || !pager.hasClients) return;
+    final p = _basePage + d.difference(_baseDate).inDays;
+    if (p < 0 || p >= _pageCount) return;
+    pager.jumpToPage(p);
+  }
+
+  void _selectDay(DateTime d) {
+    final day = dateOnly(d);
+    final changedMonth =
+        day.year != _monthStart.year || day.month != _monthStart.month;
+    setState(() {
+      _selected = day;
+      if (changedMonth) {
+        _monthStart = DateTime(day.year, day.month, 1);
+      }
+    });
+    _jumpPager(day);
+    // Same month: the grid already shows this month's data. New month:
+    // fetch it so both the grid dots and the agenda agree.
+    if (changedMonth) _loadMonth(_monthStart);
+  }
+
+  void _onDayPage(int i) {
+    final d = addDays(_baseDate, i - _basePage);
+    final changedMonth =
+        d.year != _monthStart.year || d.month != _monthStart.month;
+    setState(() {
+      _selected = d;
+      if (changedMonth) _monthStart = DateTime(d.year, d.month, 1);
+    });
+    if (changedMonth) _loadMonth(_monthStart);
+  }
+
+  void _goToday() {
+    final now = dateOnly(DateTime.now());
+    setState(() {
+      _selected = now;
+      _monthStart = DateTime(now.year, now.month, 1);
+    });
+    _jumpPager(now);
+    _loadMonth(_monthStart);
+  }
+
+  void _stepMonth(int delta) {
+    final m = DateTime(_monthStart.year, _monthStart.month + delta, 1);
+    final dim = daysInMonth(m.year, m.month);
+    final d = _selected.day > dim ? dim : _selected.day;
+    final sel = DateTime(m.year, m.month, d);
+    setState(() {
+      _monthStart = m;
+      _selected = sel;
+    });
+    _jumpPager(sel);
+    _loadMonth(m);
+  }
+
+  // -- item actions --------------------------------------------------------
+
+  Future<void> _toggleDone(Map<String, dynamic> item) async {
+    final api = _api;
+    final id = (item['id'] ?? '').toString();
+    if (api == null || id.isEmpty) return;
+    try {
+      if (itemIsDone(item)) {
+        await api.reopenTask(id);
+      } else {
+        await api.completeTask(id);
+      }
+      if (!mounted) return;
+      await _loadMonth(_monthStart);
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() => _notice = e.message);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _notice = 'Something went wrong: $e');
+    }
+  }
+
+  Future<void> _confirmDelete(Map<String, dynamic> item) async {
+    final api = _api;
+    final id = (item['id'] ?? '').toString();
+    if (api == null || id.isEmpty) return;
+    final ok = await showCupertinoDialog<bool>(
+      context: context,
+      builder: (ctx) => CupertinoAlertDialog(
+        title: const Text('Delete event?'),
+        content: Text(itemTitle(item)),
+        actions: [
+          CupertinoDialogAction(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          CupertinoDialogAction(
+            isDestructiveAction: true,
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    try {
+      await api.deleteTask(id);
+      if (!mounted) return;
+      await _loadMonth(_monthStart);
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() => _notice = e.message);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _notice = 'Something went wrong: $e');
+    }
+  }
+
+  void _itemActions(Map<String, dynamic> item) {
+    final done = itemIsDone(item);
+    showCupertinoModalPopup<void>(
+      context: context,
+      builder: (ctx) => CupertinoActionSheet(
+        title: Text(itemTitle(item)),
+        message: Text(itemTimeLabel(item)),
+        actions: [
+          CupertinoActionSheetAction(
+            onPressed: () {
+              Navigator.of(ctx).pop();
+              _openEditor(existing: item);
+            },
+            child: const Text('Edit'),
+          ),
+          CupertinoActionSheetAction(
+            onPressed: () {
+              Navigator.of(ctx).pop();
+              _toggleDone(item);
+            },
+            child: Text(done ? 'Mark not done' : 'Mark done'),
+          ),
+          CupertinoActionSheetAction(
+            isDestructiveAction: true,
+            onPressed: () {
+              Navigator.of(ctx).pop();
+              _confirmDelete(item);
+            },
+            child: const Text('Delete'),
+          ),
+        ],
+        cancelButton: CupertinoActionSheetAction(
+          onPressed: () => Navigator.of(ctx).pop(),
+          child: const Text('Cancel'),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openEditor(
+      {Map<String, dynamic>? existing, DateTime? date}) async {
+    final api = _api;
+    if (api == null) return;
+    final changed = await Navigator.of(context).push<bool>(
+      CupertinoPageRoute<bool>(
+        builder: (_) => _EventEditorPage(
+          api: api,
+          existing: existing,
+          initialDate: date ?? _selected,
+        ),
+      ),
+    );
+    if (changed == true && mounted) {
+      await _loadMonth(_monthStart);
+    }
+  }
+
+  Future<void> _sendCommand() async {
+    final api = _api;
+    final text = _cmd.text.trim();
+    if (api == null || text.isEmpty || _sending) return;
+    setState(() {
+      _sending = true;
+      _cmdError = null;
+    });
+    try {
+      final res = await api.command(text);
+      if (!mounted) return;
+      final reply = (res['reply'] ?? '').toString();
+      final applied = Safe.mapList(res['applied']);
+      final problems = <String>[];
+      for (final a in applied) {
+        final err = (a['error'] ?? '').toString();
+        if (err.isNotEmpty) {
+          final what = (a['title'] ?? a['action'] ?? 'item').toString();
+          problems.add('$what: $err');
+        }
+      }
+      setState(() {
+        _history.insert(
+            0,
+            _Exchange(
+                instruction: text,
+                reply: reply.isEmpty ? 'Done.' : reply,
+                problems: problems));
+        if (_history.length > 5) _history.removeLast();
+        _cmd.clear();
+        _sending = false;
+      });
+      await _loadMonth(_monthStart);
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _cmdError = e.message;
+        _sending = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _cmdError = 'Something went wrong: $e';
+        _sending = false;
+      });
+    }
+  }
+
+  // -- build ---------------------------------------------------------------
 
   @override
   Widget build(BuildContext context) {
     return CupertinoPageScaffold(
+      navigationBar: CupertinoNavigationBar(
+        middle: Text(
+            '${monthName(_monthStart.month)} ${_monthStart.year}'),
+        leading: CupertinoButton(
+          padding: EdgeInsets.zero,
+          onPressed: _goToday,
+          child: const Text('Today'),
+        ),
+        trailing: CupertinoButton(
+          padding: EdgeInsets.zero,
+          onPressed: () => _openEditor(date: _selected),
+          child: const Icon(CupertinoIcons.plus),
+        ),
+      ),
       child: Container(
         decoration: const BoxDecoration(
           gradient: LinearGradient(
             begin: Alignment.topCenter,
             end: Alignment.bottomCenter,
-            colors: [C.bgTop, C.bg],
+            colors: [AppColors.bgTop, AppColors.bgBase],
           ),
         ),
         child: SafeArea(
           // Cupertino pull-to-refresh: CustomScrollView + slivers.
-          // RefreshIndicator is a Material widget and this app imports only
-          // package:flutter/cupertino.dart, so it would not compile.
           child: CustomScrollView(
             slivers: [
               CupertinoSliverRefreshControl(onRefresh: _refresh),
               SliverPadding(
-                padding: const EdgeInsets.fromLTRB(20, 24, 20, 40),
+                padding: const EdgeInsets.fromLTRB(20, 20, 20, 40),
                 sliver: SliverList(
                   delegate: SliverChildListDelegate(_buildBody()),
                 ),
@@ -163,175 +633,836 @@ class _CalendarPageState extends State<CalendarPage> {
         Center(child: CupertinoActivityIndicator(radius: 14)),
       ];
     }
-    if (_error != null) {
+    if (_error != null && _byDay.isEmpty && _inbox.isEmpty) {
       return [
-        const SizedBox(height: 100),
+        const SizedBox(height: 80),
         const Icon(CupertinoIcons.wifi_slash,
-            size: 44, color: C.textTertiary),
+            size: 44, color: AppColors.textTertiary),
         const SizedBox(height: 14),
-        Text(_error!,
+        Text(_error ?? 'Something went wrong',
             textAlign: TextAlign.center,
-            style: const TextStyle(fontSize: 15, color: C.textSecondary)),
+            style:
+                const TextStyle(fontSize: 15, color: AppColors.textSecondary)),
         const SizedBox(height: 20),
-        CupertinoButton(
-          onPressed: _refresh,
-          child: const Text('Retry'),
+        Center(
+          child: CupertinoButton(
+            onPressed: () => _loadMonth(_monthStart, spinner: true),
+            child: const Text('Retry'),
+          ),
         ),
       ];
     }
 
+    final total = _monthTotal;
     return [
-      const Text('Today',
+      const Text('Calendar',
           style: TextStyle(
               fontSize: 34,
               fontWeight: FontWeight.w700,
-              color: C.textPrimary)),
+              color: AppColors.textPrimary)),
       const SizedBox(height: 4),
-      Text(_todayLabel(),
-          style: const TextStyle(fontSize: 15, color: C.textSecondary)),
-      const SizedBox(height: 22),
-      Row(children: [
-        Expanded(
-            child: _stat('${_startable.length}', 'to start', C.accent)),
-        const SizedBox(width: 12),
-        Expanded(
-            child: _stat('$_plannedMinutes', 'minutes planned', C.accent)),
-        const SizedBox(width: 12),
-        Expanded(child: _stat('$_focusMinutes', 'focused', C.success)),
-      ]),
-      const SizedBox(height: 26),
-      const Text('UP NEXT',
-          style: TextStyle(
-              fontSize: 12,
-              fontWeight: FontWeight.w600,
-              letterSpacing: 1,
-              color: C.textTertiary)),
-      const SizedBox(height: 10),
-      if (_startable.isEmpty)
-        _card(
-          child: const Padding(
-            padding: EdgeInsets.all(20),
-            child: Text('Nothing startable right now.',
-                style: TextStyle(fontSize: 15, color: C.textSecondary)),
+      Text(
+          total == 0
+              ? 'Nothing scheduled this month'
+              : '$total ${total == 1 ? 'event' : 'events'} this month',
+          style:
+              const TextStyle(fontSize: 15, color: AppColors.textSecondary)),
+      const SizedBox(height: 18),
+      if (_notice != null) ...[
+        _glass(
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Text(_notice ?? '',
+                style: const TextStyle(
+                    fontSize: 13, color: AppColors.danger)),
           ),
-        )
-      else
-        ..._startable.map(_taskRow),
-      if (_done.isNotEmpty) ...[
-        const SizedBox(height: 26),
-        Text('DONE TODAY · ${_done.length}',
-            style: const TextStyle(
-                fontSize: 12,
-                fontWeight: FontWeight.w600,
-                letterSpacing: 1,
-                color: C.textTertiary)),
-        const SizedBox(height: 10),
-        ..._done.map((t) => _card(
-              child: Padding(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-                child: Row(children: [
-                  const Icon(CupertinoIcons.checkmark_alt,
-                      size: 18, color: C.success),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Text(t['title']?.toString() ?? '',
-                        style: const TextStyle(
-                            fontSize: 15,
-                            color: C.textSecondary,
-                            decoration: TextDecoration.lineThrough)),
-                  ),
-                ]),
-              ),
-            )),
+        ),
+        const SizedBox(height: 12),
       ],
+      _monthCard(),
+      const SizedBox(height: 16),
+      _dayCard(),
+      if (_inbox.isNotEmpty) ...[
+        const SizedBox(height: 16),
+        _inboxCard(),
+      ],
+      const SizedBox(height: 16),
+      _commandCard(),
     ];
   }
 
-  String _todayLabel() {
-    const days = [
-      'Monday', 'Tuesday', 'Wednesday', 'Thursday',
-      'Friday', 'Saturday', 'Sunday',
-    ];
-    const months = [
-      'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
-    ];
-    final n = DateTime.now();
-    return '${days[n.weekday - 1]}, ${n.day} ${months[n.month - 1]}';
+  // -- month grid ----------------------------------------------------------
+
+  Widget _monthCard() {
+    final year = _monthStart.year;
+    final month = _monthStart.month;
+    final first = DateTime(year, month, 1);
+    final dim = daysInMonth(year, month);
+    // Monday-first grid: leading blanks before the 1st.
+    final leading = first.weekday - 1;
+    final todayK = dayKey(DateTime.now());
+    final selK = dayKey(_selected);
+
+    final cells = <Widget>[];
+    for (var i = 0; i < leading; i++) {
+      cells.add(const Expanded(child: SizedBox(height: 44)));
+    }
+    for (var n = 1; n <= dim; n++) {
+      final d = DateTime(year, month, n);
+      final k = dayKey(d);
+      final isToday = k == todayK;
+      final isSel = k == selK;
+      final busy = _hasDay(k);
+      cells.add(Expanded(
+        child: GestureDetector(
+          onTap: () => _selectDay(d),
+          behavior: HitTestBehavior.opaque,
+          child: Container(
+            height: 44,
+            margin: const EdgeInsets.all(2),
+            decoration: BoxDecoration(
+              color: isSel
+                  // accentSoft at ~16% alpha, as a const (no runtime call).
+                  ? const Color(0x298B5CF6)
+                  : const Color(0x00000000),
+              borderRadius: BorderRadius.circular(10),
+              border: isSel
+                  ? Border.all(color: AppColors.accent, width: 1.5)
+                  : null,
+            ),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Container(
+                  width: 28,
+                  height: 28,
+                  decoration: BoxDecoration(
+                    color: isToday
+                        ? AppColors.accent
+                        : const Color(0x00000000),
+                    shape: BoxShape.circle,
+                  ),
+                  alignment: Alignment.center,
+                  child: Text('$n',
+                      style: TextStyle(
+                          fontSize: 14,
+                          fontWeight:
+                              isToday ? FontWeight.w700 : FontWeight.w500,
+                          color: isToday
+                              ? CupertinoColors.white
+                              : AppColors.textPrimary)),
+                ),
+                const SizedBox(height: 2),
+                Container(
+                  width: 6,
+                  height: 6,
+                  decoration: BoxDecoration(
+                    color: busy
+                        ? (isToday
+                            ? AppColors.accent
+                            : AppColors.accentSoft)
+                        : const Color(0x00000000),
+                    shape: BoxShape.circle,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ));
+    }
+    final trailing = (7 - ((leading + dim) % 7)) % 7;
+    for (var i = 0; i < trailing; i++) {
+      cells.add(const Expanded(child: SizedBox(height: 44)));
+    }
+
+    final rows = <Widget>[];
+    const weekHead = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
+    // Weekday header labels.
+    rows.add(Row(
+      children: [
+        for (final w in weekHead)
+          Expanded(
+            child: Center(
+              child: Text(w,
+                  style: const TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600,
+                      color: AppColors.textTertiary)),
+            ),
+          ),
+      ],
+    ));
+    rows.add(const SizedBox(height: 6));
+    for (var i = 0; i < cells.length; i += 7) {
+      final week = <Widget>[];
+      for (var j = i; j < i + 7 && j < cells.length; j++) {
+        week.add(cells[j]);
+      }
+      rows.add(Row(children: week));
+    }
+
+    return _glass(
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          children: [
+            Row(
+              children: [
+                CupertinoButton(
+                  padding: EdgeInsets.zero,
+                  onPressed: () => _stepMonth(-1),
+                  child: const Icon(CupertinoIcons.chevron_left, size: 22),
+                ),
+                Expanded(
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Text('${monthName(month)} $year',
+                          style: const TextStyle(
+                              fontSize: 17,
+                              fontWeight: FontWeight.w700,
+                              color: AppColors.textPrimary)),
+                      if (_loadingMonth) ...[
+                        const SizedBox(width: 8),
+                        const CupertinoActivityIndicator(radius: 8),
+                      ],
+                    ],
+                  ),
+                ),
+                CupertinoButton(
+                  padding: EdgeInsets.zero,
+                  onPressed: () => _stepMonth(1),
+                  child: const Icon(CupertinoIcons.chevron_right, size: 22),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            ...rows,
+          ],
+        ),
+      ),
+    );
   }
 
-  Widget _stat(String value, String label, Color color) => _card(
-        child: Padding(
-          padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 8),
-          child: Column(children: [
-            Text(value,
+  // -- day agenda (swipeable) ----------------------------------------------
+
+  Widget _dayCard() {
+    return _glass(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(14, 14, 14, 16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                      '${weekdayName(_selected.weekday)}, ${_selected.day} ${monthName(_selected.month)}',
+                      style: const TextStyle(
+                          fontSize: 17,
+                          fontWeight: FontWeight.w700,
+                          color: AppColors.textPrimary)),
+                ),
+                CupertinoButton(
+                  padding: EdgeInsets.zero,
+                  onPressed: () => _openEditor(date: _selected),
+                  child: const Icon(CupertinoIcons.plus, size: 22),
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            const Text('Swipe sideways to move between days',
                 style: TextStyle(
-                    fontSize: 22, fontWeight: FontWeight.w700, color: color)),
-            const SizedBox(height: 3),
-            Text(label,
-                textAlign: TextAlign.center,
-                style: const TextStyle(fontSize: 11, color: C.textSecondary)),
-          ]),
+                    fontSize: 12, color: AppColors.textTertiary)),
+            const SizedBox(height: 8),
+            SizedBox(
+              height: 380,
+              child: PageView.builder(
+                controller: _dayPager,
+                itemCount: _pageCount,
+                onPageChanged: _onDayPage,
+                itemBuilder: (ctx, i) =>
+                    _dayPage(addDays(_baseDate, i - _basePage)),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _dayPage(DateTime d) {
+    final k = dayKey(d);
+    final raw = _byDay[k] ?? <Map<String, dynamic>>[];
+    final items = sortDayItems(raw);
+    if (items.isEmpty) {
+      return const SingleChildScrollView(
+        child: Padding(
+          padding: EdgeInsets.symmetric(vertical: 40, horizontal: 12),
+          child: Column(
+            children: [
+              Text('Nothing scheduled',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w600,
+                      color: AppColors.textSecondary)),
+              SizedBox(height: 6),
+              Text('Tap + to add an event, or ask Hermes below.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                      fontSize: 13, color: AppColors.textTertiary)),
+            ],
+          ),
         ),
       );
+    }
+    return SingleChildScrollView(
+      child: Column(
+        children: [
+          for (final it in items) ...[
+            _agendaRow(it),
+            const SizedBox(height: 8),
+          ],
+        ],
+      ),
+    );
+  }
 
-  Widget _taskRow(Map<String, dynamic> t) => Padding(
-        padding: const EdgeInsets.only(bottom: 10),
-        child: _card(
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Row(children: [
-              Container(
-                width: 4,
-                height: 40,
-                decoration: BoxDecoration(
-                  color: C.accent,
-                  borderRadius: BorderRadius.circular(2),
+  Widget _agendaRow(Map<String, dynamic> item) {
+    final done = itemIsDone(item);
+    final title = itemTitle(item);
+    final time = itemTimeLabel(item);
+    final mins = itemMinutes(item);
+    final loc = (item['location'] ?? '').toString();
+    return GestureDetector(
+      onTap: () => _openEditor(existing: item),
+      onLongPress: () => _itemActions(item),
+      child: Container(
+        decoration: BoxDecoration(
+          color: const Color(0xA6FFFFFF),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: const Color(0x14000000)),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              GestureDetector(
+                onTap: () => _toggleDone(item),
+                child: Container(
+                  width: 26,
+                  height: 26,
+                  margin: const EdgeInsets.only(top: 1),
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: done
+                        ? AppColors.success
+                        : const Color(0x00000000),
+                    border: Border.all(
+                        color: done
+                            ? AppColors.success
+                            : AppColors.textTertiary,
+                        width: 1.5),
+                  ),
+                  child: done
+                      ? const Icon(CupertinoIcons.checkmark_alt,
+                          size: 14, color: CupertinoColors.white)
+                      : null,
                 ),
               ),
-              const SizedBox(width: 14),
+              const SizedBox(width: 12),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(t['title']?.toString() ?? '',
-                        style: const TextStyle(
+                    Text(title.isEmpty ? '(no title)' : title,
+                        style: TextStyle(
                             fontSize: 15,
-                            fontWeight: FontWeight.w500,
-                            color: C.textPrimary)),
-                    if ((t['why'] ?? '').toString().isNotEmpty) ...[
-                      const SizedBox(height: 4),
-                      Text(t['why'].toString(),
+                            fontWeight: FontWeight.w600,
+                            color: done
+                                ? AppColors.textTertiary
+                                : AppColors.textPrimary,
+                            decoration: done
+                                ? TextDecoration.lineThrough
+                                : TextDecoration.none)),
+                    const SizedBox(height: 3),
+                    Text('$time · $mins min',
+                        style: const TextStyle(
+                            fontSize: 13,
+                            color: AppColors.textSecondary)),
+                    if (loc.isNotEmpty) ...[
+                      const SizedBox(height: 2),
+                      Text(loc,
                           style: const TextStyle(
-                              fontSize: 12, color: C.textTertiary)),
+                              fontSize: 13,
+                              color: AppColors.textSecondary)),
                     ],
                   ],
                 ),
               ),
-              const SizedBox(width: 10),
-              Text('${t['minutes']}m',
-                  style: const TextStyle(
-                      fontSize: 13, color: C.textSecondary)),
-            ]),
+            ],
           ),
         ),
-      );
+      ),
+    );
+  }
 
-  Widget _card({required Widget child}) => Container(
+  // -- inbox ---------------------------------------------------------------
+
+  Widget _inboxCard() {
+    return _glass(
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Undated · ${_inbox.length}',
+                style: const TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: 1,
+                    color: AppColors.textTertiary)),
+            const SizedBox(height: 10),
+            for (final it in _inbox) ...[
+              _agendaRow(it),
+              const SizedBox(height: 8),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  // -- command bar ----------------------------------------------------------
+
+  Widget _commandCard() {
+    return _glass(
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Ask Hermes',
+                style: TextStyle(
+                    fontSize: 17,
+                    fontWeight: FontWeight.w700,
+                    color: AppColors.textPrimary)),
+            const SizedBox(height: 4),
+            const Text(
+                'e.g. "move my 3pm to tomorrow" or "add gym Friday 7am for an hour"',
+                style: TextStyle(
+                    fontSize: 12, color: AppColors.textTertiary)),
+            const SizedBox(height: 10),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                Expanded(
+                  child: CupertinoTextField(
+                    controller: _cmd,
+                    placeholder: 'Type an instruction',
+                    maxLines: 2,
+                    onSubmitted: (_) => _sendCommand(),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                CupertinoButton(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 14, vertical: 8),
+                  color: AppColors.accent,
+                  onPressed: _sending ? null : _sendCommand,
+                  child: _sending
+                      ? const CupertinoActivityIndicator(
+                          radius: 9, color: CupertinoColors.white)
+                      : const Text('Send',
+                          style: TextStyle(
+                              color: CupertinoColors.white)),
+                ),
+              ],
+            ),
+            if (_cmdError != null) ...[
+              const SizedBox(height: 8),
+              Text(_cmdError ?? '',
+                  style: const TextStyle(
+                      fontSize: 13, color: AppColors.danger)),
+            ],
+            const SizedBox(height: 10),
+            if (_history.isEmpty)
+              const Text('Recent instructions will appear here.',
+                  style: TextStyle(
+                      fontSize: 12, color: AppColors.textTertiary))
+            else
+              for (final h in _history) ...[
+                Container(
+                  margin: const EdgeInsets.only(bottom: 8),
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xA6FFFFFF),
+                    borderRadius: BorderRadius.circular(10),
+                    border:
+                        Border.all(color: const Color(0x14000000)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(h.instruction,
+                          style: const TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
+                              color: AppColors.textTertiary)),
+                      const SizedBox(height: 4),
+                      Text(h.reply,
+                          style: const TextStyle(
+                              fontSize: 14,
+                              color: AppColors.textPrimary)),
+                      for (final p in h.problems) ...[
+                        const SizedBox(height: 4),
+                        Text(p,
+                            style: const TextStyle(
+                                fontSize: 13,
+                                color: AppColors.danger)),
+                      ],
+                    ],
+                  ),
+                ),
+              ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  // -- shared chrome ---------------------------------------------------------
+
+  Widget _glass({required Widget child}) => Container(
         decoration: BoxDecoration(
-          color: C.glass,
+          color: AppColors.glass,
           borderRadius: BorderRadius.circular(16),
           border: Border.all(color: const Color(0x14000000)),
           boxShadow: const [
             BoxShadow(
-                color: Color(0x0D000000), blurRadius: 18, offset: Offset(0, 6)),
+                color: Color(0x0D000000),
+                blurRadius: 18,
+                offset: Offset(0, 6)),
           ],
         ),
         child: child,
       );
 }
 
+// ---------------------------------------------------------------------------
+// Create / edit page.
+// ---------------------------------------------------------------------------
+
+class _EventEditorPage extends StatefulWidget {
+  const _EventEditorPage(
+      {required this.api, this.existing, required this.initialDate});
+
+  final Api api;
+  final Map<String, dynamic>? existing;
+  final DateTime initialDate;
+
+  @override
+  State<_EventEditorPage> createState() => _EventEditorPageState();
+}
+
+class _EventEditorPageState extends State<_EventEditorPage> {
+  final TextEditingController _title = TextEditingController();
+  final TextEditingController _minutes = TextEditingController();
+  final TextEditingController _location = TextEditingController();
+  final TextEditingController _notes = TextEditingController();
+
+  String? _id;
+  late DateTime _start;
+  bool _allDay = false;
+  bool _saving = false;
+  bool _deleting = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    final ex = widget.existing;
+    if (ex == null) {
+      _start = DateTime(widget.initialDate.year, widget.initialDate.month,
+          widget.initialDate.day, 9, 0);
+      _minutes.text = '30';
+    } else {
+      _id = (ex['id'] ?? '').toString();
+      if (_id != null && _id!.isEmpty) _id = null;
+      _title.text = (ex['title'] ?? '').toString();
+      _allDay = itemIsAllDay(ex);
+      final w = parseWhen(ex);
+      if (w == null) {
+        _start = DateTime(widget.initialDate.year, widget.initialDate.month,
+            widget.initialDate.day, 9, 0);
+      } else {
+        _start = w;
+      }
+      _minutes.text = '${itemMinutes(ex)}';
+      _location.text = (ex['location'] ?? '').toString();
+      _notes.text = (ex['notes'] ?? '').toString();
+    }
+  }
+
+  @override
+  void dispose() {
+    _title.dispose();
+    _minutes.dispose();
+    _location.dispose();
+    _notes.dispose();
+    super.dispose();
+  }
+
+  Future<void> _save() async {
+    final title = _title.text.trim();
+    if (title.isEmpty) {
+      setState(() => _error = 'Give the event a title.');
+      return;
+    }
+    final parsed = int.tryParse(_minutes.text.trim());
+    final mins = parsed == null || parsed <= 0 ? 30 : parsed;
+    final loc = _location.text.trim();
+    final notes = _notes.text.trim();
+    setState(() {
+      _saving = true;
+      _error = null;
+    });
+    try {
+      final sched = _allDay
+          ? '${dayKey(_start)}T00:00:00'
+          : '${dayKey(_start)}T${_two(_start.hour)}:${_two(_start.minute)}:00';
+      await widget.api.upsertTask(
+        id: _id,
+        title: title,
+        scheduledAt: sched,
+        minutes: mins,
+        allDay: _allDay,
+        location: loc.isEmpty ? null : loc,
+        notes: notes.isEmpty ? null : notes,
+      );
+      if (!mounted) return;
+      Navigator.of(context).pop(true);
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = e.message;
+        _saving = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = 'Something went wrong: $e';
+        _saving = false;
+      });
+    }
+  }
+
+  Future<void> _delete() async {
+    final id = _id;
+    if (id == null || id.isEmpty) return;
+    final ok = await showCupertinoDialog<bool>(
+      context: context,
+      builder: (ctx) => CupertinoAlertDialog(
+        title: const Text('Delete event?'),
+        content: Text(_title.text.trim()),
+        actions: [
+          CupertinoDialogAction(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          CupertinoDialogAction(
+            isDestructiveAction: true,
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    setState(() {
+      _deleting = true;
+      _error = null;
+    });
+    try {
+      await widget.api.deleteTask(id);
+      if (!mounted) return;
+      Navigator.of(context).pop(true);
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = e.message;
+        _deleting = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = 'Something went wrong: $e';
+        _deleting = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final editing = _id != null;
+    return CupertinoPageScaffold(
+      navigationBar: CupertinoNavigationBar(
+        middle: Text(editing ? 'Edit event' : 'New event'),
+        leading: CupertinoButton(
+          padding: EdgeInsets.zero,
+          onPressed: () => Navigator.of(context).pop(false),
+          child: const Text('Cancel'),
+        ),
+        trailing: _saving
+            ? const CupertinoActivityIndicator(radius: 9)
+            : CupertinoButton(
+                padding: EdgeInsets.zero,
+                onPressed: _save,
+                child: const Text('Save',
+                    style: TextStyle(fontWeight: FontWeight.w600)),
+              ),
+      ),
+      child: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [AppColors.bgTop, AppColors.bgBase],
+          ),
+        ),
+        child: SafeArea(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.fromLTRB(20, 20, 20, 40),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('Title',
+                    style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        letterSpacing: 1,
+                        color: AppColors.textTertiary)),
+                const SizedBox(height: 6),
+                CupertinoTextField(
+                  controller: _title,
+                  placeholder: 'Event title',
+                ),
+                const SizedBox(height: 16),
+                Row(
+                  children: [
+                    const Expanded(
+                      child: Text('All-day',
+                          style: TextStyle(
+                              fontSize: 15,
+                              color: AppColors.textPrimary)),
+                    ),
+                    CupertinoSwitch(
+                      value: _allDay,
+                      onChanged: (v) => setState(() => _allDay = v),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 16),
+                const Text('Starts',
+                    style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        letterSpacing: 1,
+                        color: AppColors.textTertiary)),
+                const SizedBox(height: 6),
+                Container(
+                  decoration: BoxDecoration(
+                    color: AppColors.glass,
+                    borderRadius: BorderRadius.circular(12),
+                    border:
+                        Border.all(color: const Color(0x14000000)),
+                  ),
+                  child: SizedBox(
+                    height: 180,
+                    child: CupertinoDatePicker(
+                      mode: CupertinoDatePickerMode.dateAndTime,
+                      initialDateTime: _start,
+                      onDateTimeChanged: (d) =>
+                          setState(() => _start = d),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                const Text('Duration (minutes)',
+                    style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        letterSpacing: 1,
+                        color: AppColors.textTertiary)),
+                const SizedBox(height: 6),
+                CupertinoTextField(
+                  controller: _minutes,
+                  placeholder: '30',
+                  keyboardType: TextInputType.number,
+                ),
+                const SizedBox(height: 16),
+                const Text('Location',
+                    style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        letterSpacing: 1,
+                        color: AppColors.textTertiary)),
+                const SizedBox(height: 6),
+                CupertinoTextField(
+                  controller: _location,
+                  placeholder: 'Where',
+                ),
+                const SizedBox(height: 16),
+                const Text('Notes',
+                    style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        letterSpacing: 1,
+                        color: AppColors.textTertiary)),
+                const SizedBox(height: 6),
+                CupertinoTextField(
+                  controller: _notes,
+                  placeholder: 'Details',
+                  maxLines: 3,
+                ),
+                if (_error != null) ...[
+                  const SizedBox(height: 12),
+                  Text(_error ?? '',
+                      style: const TextStyle(
+                          fontSize: 13, color: AppColors.danger)),
+                ],
+                if (editing) ...[
+                  const SizedBox(height: 24),
+                  Center(
+                    child: _deleting
+                        ? const CupertinoActivityIndicator(radius: 10)
+                        : CupertinoButton(
+                            onPressed: _delete,
+                            child: const Text('Delete event',
+                                style: TextStyle(
+                                    color: AppColors.danger)),
+                          ),
+                  ),
+                ],
+                const SizedBox(height: 12),
+                const Center(
+                  child: Text(
+                      'Tip: long-press an event for edit, done and delete.',
+                      style: TextStyle(
+                          fontSize: 12,
+                          color: AppColors.textTertiary)),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
 
 /// Shown instead of Flutter's default ErrorWidget when a widget's build throws.
 ///
