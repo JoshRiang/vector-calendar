@@ -41,6 +41,25 @@ class AppColors {
 
 String _two(int n) => n.toString().padLeft(2, '0');
 
+/// Colour for a priority, 1 being the most important.
+///
+/// Paired with a visible P-label in the UI: colour alone is not readable for
+/// everyone, and priority is the signal the scheduler ranks on.
+Color _priColor(int p) {
+  switch (p) {
+    case 1:
+      return AppColors.danger;
+    case 2:
+      return AppColors.warning;
+    case 3:
+      return AppColors.accent;
+    case 4:
+      return AppColors.textTertiary;
+    default:
+      return AppColors.textTertiary;
+  }
+}
+
 /// 'YYYY-MM-DD' key used to group items per day.
 String dayKey(DateTime d) =>
     '${d.year.toString().padLeft(4, '0')}-${_two(d.month)}-${_two(d.day)}';
@@ -92,6 +111,114 @@ String itemTitle(Map<String, dynamic> item) =>
 
 bool itemIsDone(Map<String, dynamic> item) =>
     (item['status'] ?? '').toString() == 'done';
+
+/// A day laid out as an hour-by-hour grid.
+///
+/// The user's complaint was that the calendar "only show dates not hours", so
+/// the day view is a real time grid: one row per hour, items drawn as blocks at
+/// their actual time and sized by their duration. An agenda list is not a
+/// calendar.
+const int kDayStartHour = 5; // 05:00 - the range the user chose
+const int kDayEndHour = 24; // through midnight
+const double kHourHeight = 58.0;
+
+int _startMin(Map<String, dynamic> item) {
+  final w = parseWhen(item);
+  if (w == null) return kDayStartHour * 60;
+  final m = w.hour * 60 + w.minute;
+  // An item outside the visible range is clamped to the edge rather than
+  // dropped, so work before 05:00 is still visible instead of silently missing.
+  final floor = kDayStartHour * 60;
+  final ceil = kDayEndHour * 60 - 15;
+  if (m < floor) return floor;
+  if (m > ceil) return ceil;
+  return m;
+}
+
+int _durMin(Map<String, dynamic> item) {
+  final m = itemMinutes(item);
+  // A very short block is unreadable in a grid, and a huge one would push the
+  // rest off-screen; clamp for layout only, never in the data.
+  if (m < 20) return 20;
+  if (m > 240) return 240;
+  return m;
+}
+
+/// One item positioned in the grid.
+class _Placed {
+  const _Placed(this.item, this.col, this.cols);
+  final Map<String, dynamic> item;
+  final int col;
+  final int cols;
+
+  double top() =>
+      (_startMin(item) - kDayStartHour * 60) / 60.0 * kHourHeight;
+
+  double height() => _durMin(item) / 60.0 * kHourHeight;
+}
+
+/// Assign overlapping items to columns so none is drawn on top of another.
+///
+/// Items are grouped into clusters of transitively-overlapping work; within a
+/// cluster each item takes the first column that is free at its start. The
+/// cluster's column count sets each block's width, so a lone item still spans
+/// the full grid rather than a third of it.
+List<_Placed> layoutDay(List<Map<String, dynamic>> timed) {
+  final items = timed.toList()
+    ..sort((a, b) {
+      final s = _startMin(a).compareTo(_startMin(b));
+      if (s != 0) return s;
+      return itemTitle(a).compareTo(itemTitle(b));
+    });
+
+  final out = <_Placed>[];
+  var cluster = <Map<String, dynamic>>[];
+  var clusterEnd = -1;
+
+  void flush() {
+    if (cluster.isEmpty) return;
+    final colEnds = <int>[];
+    final colOf = <String, int>{};
+    for (final it in cluster) {
+      final s = _startMin(it);
+      final e = s + _durMin(it);
+      var placed = -1;
+      for (var c = 0; c < colEnds.length; c++) {
+        if (colEnds[c] <= s) {
+          placed = c;
+          colEnds[c] = e;
+          break;
+        }
+      }
+      if (placed == -1) {
+        colEnds.add(e);
+        placed = colEnds.length - 1;
+      }
+      colOf[(it['id'] ?? '').toString()] = placed;
+    }
+    for (final it in cluster) {
+      out.add(_Placed(it, colOf[(it['id'] ?? '').toString()] ?? 0,
+          colEnds.length));
+    }
+    cluster = <Map<String, dynamic>>[];
+    clusterEnd = -1;
+  }
+
+  for (final it in items) {
+    final s = _startMin(it);
+    final e = s + _durMin(it);
+    if (cluster.isEmpty || s < clusterEnd) {
+      cluster.add(it);
+      if (e > clusterEnd) clusterEnd = e;
+    } else {
+      flush();
+      cluster.add(it);
+      clusterEnd = e;
+    }
+  }
+  flush();
+  return out;
+}
 
 /// Day key for grouping; '' when the item has no usable date (inbox work).
 String itemDateKey(Map<String, dynamic> item) {
@@ -154,16 +281,6 @@ class VectorCalendarApp extends StatelessWidget {
 }
 
 /// One command-bar exchange, kept visible so the user sees what changed.
-class _Exchange {
-  const _Exchange(
-      {required this.instruction,
-      required this.reply,
-      required this.problems});
-
-  final String instruction;
-  final String reply;
-  final List<String> problems;
-}
 
 class CalendarPage extends StatefulWidget {
   const CalendarPage({super.key});
@@ -194,9 +311,7 @@ class _CalendarPageState extends State<CalendarPage> {
   List<Map<String, dynamic>> _inbox = [];
 
   final TextEditingController _cmd = TextEditingController();
-  bool _sending = false;
   String? _cmdError;
-  final List<_Exchange> _history = [];
 
   @override
   void initState() {
@@ -227,7 +342,6 @@ class _CalendarPageState extends State<CalendarPage> {
     }
     _api = Api(userId: id);
     await _loadMonth(_monthStart, spinner: true);
-    await _loadHistory();
   }
 
   Future<void> _refresh() => _loadMonth(_monthStart);
@@ -312,46 +426,6 @@ class _CalendarPageState extends State<CalendarPage> {
 
   /// Recent command history so the exchange stays visible across restarts.
   /// Best-effort: an unknown shape or a failure must never touch the calendar.
-  Future<void> _loadHistory() async {
-    final api = _api;
-    if (api == null) return;
-    try {
-      final h = await api.commandHistory();
-      if (!mounted) return;
-      final back = <_Exchange>[];
-      for (final m in h) {
-        // GET /commands returns {id, role, content, created_at}. Reading
-        // instruction/reply instead meant every entry was skipped as empty, so
-        // the history appeared to be permanently blank.
-        final role = (m['role'] ?? '').toString();
-        final content = (m['content'] ??
-                m['instruction'] ??
-                m['reply'] ??
-                m['input'] ??
-                m['output'] ??
-                m['text'] ??
-                m['result'] ??
-                '')
-            .toString();
-        if (content.isEmpty) continue;
-        final isUser = role == 'user';
-        back.add(_Exchange(
-            instruction: isUser ? content : '(earlier)',
-            reply: isUser ? '(no reply shown)' : content,
-            problems: const <String>[]));
-        if (back.length >= 5) break;
-      }
-      if (back.isNotEmpty && mounted) {
-        setState(() {
-          for (final e in back) {
-            _history.add(e);
-          }
-        });
-      }
-    } catch (_) {
-      // History is a nicety; ignore.
-    }
-  }
 
   int get _monthTotal {
     var n = 0;
@@ -543,53 +617,6 @@ class _CalendarPageState extends State<CalendarPage> {
     }
   }
 
-  Future<void> _sendCommand() async {
-    final api = _api;
-    final text = _cmd.text.trim();
-    if (api == null || text.isEmpty || _sending) return;
-    setState(() {
-      _sending = true;
-      _cmdError = null;
-    });
-    try {
-      final res = await api.command(text);
-      if (!mounted) return;
-      final reply = (res['reply'] ?? '').toString();
-      final applied = Safe.mapList(res['applied']);
-      final problems = <String>[];
-      for (final a in applied) {
-        final err = (a['error'] ?? '').toString();
-        if (err.isNotEmpty) {
-          final what = (a['title'] ?? a['action'] ?? 'item').toString();
-          problems.add('$what: $err');
-        }
-      }
-      setState(() {
-        _history.insert(
-            0,
-            _Exchange(
-                instruction: text,
-                reply: reply.isEmpty ? 'Done.' : reply,
-                problems: problems));
-        if (_history.length > 5) _history.removeLast();
-        _cmd.clear();
-        _sending = false;
-      });
-      await _loadMonth(_monthStart);
-    } on ApiException catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _cmdError = e.message;
-        _sending = false;
-      });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _cmdError = 'Something went wrong: $e';
-        _sending = false;
-      });
-    }
-  }
 
   // -- build ---------------------------------------------------------------
 
@@ -697,7 +724,6 @@ class _CalendarPageState extends State<CalendarPage> {
         _inboxCard(),
       ],
       const SizedBox(height: 16),
-      _commandCard(),
     ];
   }
 
@@ -906,36 +932,203 @@ class _CalendarPageState extends State<CalendarPage> {
     final k = dayKey(d);
     final raw = _byDay[k] ?? <Map<String, dynamic>>[];
     final items = sortDayItems(raw);
-    if (items.isEmpty) {
-      return const SingleChildScrollView(
-        child: Padding(
-          padding: EdgeInsets.symmetric(vertical: 40, horizontal: 12),
-          child: Column(
-            children: [
-              Text('Nothing scheduled',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                      fontSize: 16,
-                      fontWeight: FontWeight.w600,
-                      color: AppColors.textSecondary)),
-              SizedBox(height: 6),
-              Text('Tap + to add an event, or ask Hermes below.',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                      fontSize: 13, color: AppColors.textTertiary)),
-            ],
-          ),
-        ),
-      );
-    }
+    // All-day and undated work is pinned above the grid: it has no hour, so
+    // putting it in the grid would invent a time for it.
+    final allDay = items
+        .where((i) => itemIsAllDay(i) || parseWhen(i) == null)
+        .toList();
+    final timed = items
+        .where((i) => !itemIsAllDay(i) && parseWhen(i) != null)
+        .toList();
+
+    final gridHeight = (kDayEndHour - kDayStartHour) * kHourHeight;
+    final placed = layoutDay(timed);
+    final isToday = dayKey(d) == dayKey(DateTime.now());
+
     return SingleChildScrollView(
       child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          for (final it in items) ...[
-            _agendaRow(it),
-            const SizedBox(height: 8),
+          if (allDay.isNotEmpty) ...[
+            _allDayStrip(allDay),
+            const SizedBox(height: 10),
           ],
+          SizedBox(
+            height: gridHeight,
+            child: Stack(
+              children: [
+                // The grid itself: one rule per hour, always drawn, so an empty
+                // day still looks like a calendar rather than a blank page.
+                Column(
+                  children: [
+                    for (var h = kDayStartHour; h < kDayEndHour; h++)
+                      SizedBox(
+                        height: kHourHeight,
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            SizedBox(
+                              width: 46,
+                              child: Text(
+                                '${_two(h)}:00',
+                                style: const TextStyle(
+                                    fontSize: 10,
+                                    color: AppColors.textTertiary),
+                              ),
+                            ),
+                            Expanded(
+                              child: Container(
+                                height: 1,
+                                color: const Color(0x14000000),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                  ],
+                ),
+                // Item blocks, positioned by real time and sized by duration.
+                for (final p in placed)
+                  Positioned(
+                    top: p.top(),
+                    left: 50,
+                    right: 0,
+                    height: p.height() - 3,
+                    child: FractionallySizedBox(
+                      alignment: Alignment.centerLeft,
+                      widthFactor: p.cols <= 1
+                          ? 1.0
+                          : (1.0 / p.cols) - (p.col == p.cols - 1 ? 0.0 : 0.02),
+                      child: Padding(
+                        padding: EdgeInsets.only(
+                            left: p.cols <= 1
+                                ? 0
+                                : p.col * (1.0 / p.cols) * 0),
+                        child: _gridBlock(p.item),
+                      ),
+                    ),
+                  ),
+                if (isToday) _nowLine(),
+              ],
+            ),
+          ),
+          if (items.isEmpty)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 22),
+              child: Text('Nothing scheduled',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                      fontSize: 15, color: AppColors.textSecondary)),
+            ),
         ],
+      ),
+    );
+  }
+
+  /// A line at the current time, only on today.
+  Widget _nowLine() {
+    final now = DateTime.now();
+    final m = now.hour * 60 + now.minute;
+    if (m < kDayStartHour * 60 || m > kDayEndHour * 60) {
+      return const SizedBox.shrink();
+    }
+    final top = (m - kDayStartHour * 60) / 60.0 * kHourHeight;
+    return Positioned(
+      top: top,
+      left: 42,
+      right: 0,
+      child: Row(
+        children: [
+          Container(
+            width: 8,
+            height: 8,
+            decoration: const BoxDecoration(
+                shape: BoxShape.circle, color: AppColors.danger),
+          ),
+          Expanded(
+            child: Container(height: 1.6, color: AppColors.danger),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// All-day and undated items, above the hour grid.
+  Widget _allDayStrip(List<Map<String, dynamic>> items) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text('ALL DAY',
+            style: TextStyle(
+                fontSize: 10,
+                fontWeight: FontWeight.w700,
+                color: AppColors.textTertiary,
+                letterSpacing: 1.1)),
+        const SizedBox(height: 6),
+        for (final it in items) ...[
+          _gridBlock(it, compact: true),
+          const SizedBox(height: 6),
+        ],
+      ],
+    );
+  }
+
+  /// One event block, drawn at its real position in the grid.
+  Widget _gridBlock(Map<String, dynamic> item, {bool compact = false}) {
+    final done = itemIsDone(item);
+    final title = itemTitle(item);
+    final mins = itemMinutes(item);
+    final loc = (item['location'] ?? '').toString();
+    final pri = Safe.number(item['priority'])?.toInt() ?? 3;
+    final start = parseWhen(item);
+    final end = start == null
+        ? null
+        : start.add(Duration(minutes: mins));
+    final range = (start == null || itemIsAllDay(item))
+        ? (compact ? 'All day' : '')
+        : '${_two(start.hour)}:${_two(start.minute)}'
+            '–${_two((end ?? start).hour)}:${_two((end ?? start).minute)}';
+    final tint = done ? AppColors.textTertiary : _priColor(pri);
+
+    return GestureDetector(
+      onTap: () => _openEditor(existing: item),
+      onLongPress: () => _itemActions(item),
+      child: Container(
+        decoration: BoxDecoration(
+          color: done ? const Color(0x33FFFFFF) : const Color(0xE6FFFFFF),
+          borderRadius: BorderRadius.circular(9),
+          border: Border(left: BorderSide(color: tint, width: 3.5)),
+        ),
+        padding: const EdgeInsets.fromLTRB(8, 5, 8, 5),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisAlignment: MainAxisAlignment.start,
+          children: [
+            Text(range,
+                style: TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.w700,
+                    color: tint)),
+            Text(title.isEmpty ? '(no title)' : title,
+                maxLines: compact ? 2 : 3,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w600,
+                    color: done
+                        ? AppColors.textTertiary
+                        : AppColors.textPrimary,
+                    decoration: done
+                        ? TextDecoration.lineThrough
+                        : TextDecoration.none)),
+            if (loc.isNotEmpty)
+              Text(loc,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                      fontSize: 10, color: AppColors.textSecondary)),
+          ],
+        ),
       ),
     );
   }
@@ -1048,101 +1241,6 @@ class _CalendarPageState extends State<CalendarPage> {
 
   // -- command bar ----------------------------------------------------------
 
-  Widget _commandCard() {
-    return _glass(
-      child: Padding(
-        padding: const EdgeInsets.all(14),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text('Ask Hermes',
-                style: TextStyle(
-                    fontSize: 17,
-                    fontWeight: FontWeight.w700,
-                    color: AppColors.textPrimary)),
-            const SizedBox(height: 4),
-            const Text(
-                'e.g. "move my 3pm to tomorrow" or "add gym Friday 7am for an hour"',
-                style: TextStyle(
-                    fontSize: 12, color: AppColors.textTertiary)),
-            const SizedBox(height: 10),
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.end,
-              children: [
-                Expanded(
-                  child: CupertinoTextField(
-                    controller: _cmd,
-                    placeholder: 'Type an instruction',
-                    maxLines: 2,
-                    onSubmitted: (_) => _sendCommand(),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                CupertinoButton(
-                  padding: const EdgeInsets.symmetric(
-                      horizontal: 14, vertical: 8),
-                  color: AppColors.accent,
-                  onPressed: _sending ? null : _sendCommand,
-                  child: _sending
-                      ? const CupertinoActivityIndicator(
-                          radius: 9, color: CupertinoColors.white)
-                      : const Text('Send',
-                          style: TextStyle(
-                              color: CupertinoColors.white)),
-                ),
-              ],
-            ),
-            if (_cmdError != null) ...[
-              const SizedBox(height: 8),
-              Text(_cmdError ?? '',
-                  style: const TextStyle(
-                      fontSize: 13, color: AppColors.danger)),
-            ],
-            const SizedBox(height: 10),
-            if (_history.isEmpty)
-              const Text('Recent instructions will appear here.',
-                  style: TextStyle(
-                      fontSize: 12, color: AppColors.textTertiary))
-            else
-              for (final h in _history) ...[
-                Container(
-                  margin: const EdgeInsets.only(bottom: 8),
-                  padding: const EdgeInsets.all(10),
-                  decoration: BoxDecoration(
-                    color: const Color(0xA6FFFFFF),
-                    borderRadius: BorderRadius.circular(10),
-                    border:
-                        Border.all(color: const Color(0x14000000)),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(h.instruction,
-                          style: const TextStyle(
-                              fontSize: 12,
-                              fontWeight: FontWeight.w600,
-                              color: AppColors.textTertiary)),
-                      const SizedBox(height: 4),
-                      Text(h.reply,
-                          style: const TextStyle(
-                              fontSize: 14,
-                              color: AppColors.textPrimary)),
-                      for (final p in h.problems) ...[
-                        const SizedBox(height: 4),
-                        Text(p,
-                            style: const TextStyle(
-                                fontSize: 13,
-                                color: AppColors.danger)),
-                      ],
-                    ],
-                  ),
-                ),
-              ],
-          ],
-        ),
-      ),
-    );
-  }
 
   // -- shared chrome ---------------------------------------------------------
 

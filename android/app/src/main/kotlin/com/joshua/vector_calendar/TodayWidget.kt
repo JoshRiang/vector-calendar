@@ -179,6 +179,25 @@ class TodayWidget : AppWidgetProvider() {
     /** Group digits so a 7-figure amount stays readable in a narrow widget. */
     private fun fmt(v: Double): String = String.format("%,.0f", v)
 
+    /** Short label for a priority. 1 is the most important. */
+    private fun priLabel(p: Int): String = when (p) {
+        1 -> "P1"
+        2 -> "P2"
+        3 -> "P3"
+        4 -> "P4"
+        else -> "P5"
+    }
+
+    /** Badge colour for a priority. Paired with priLabel so meaning is never
+     *  carried by colour alone. */
+    private fun priColor(p: Int): Int = when (p) {
+        1 -> 0xFFEF4444.toInt()
+        2 -> 0xFFF59E0B.toInt()
+        3 -> 0xFF6366F1.toInt()
+        4 -> 0xFF9CA3AF.toInt()
+        else -> 0xFFC7C7CC.toInt()
+    }
+
     /**
      * Endpoints tried in order, after the configured one.
      *
