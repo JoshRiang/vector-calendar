@@ -270,12 +270,19 @@ class VectorCalendarApp extends StatelessWidget {
   const VectorCalendarApp({super.key});
 
   @override
-  Widget build(BuildContext context) => const CupertinoApp(
+  Widget build(BuildContext context) => CupertinoApp(
         title: 'Vector Calendar',
         debugShowCheckedModeBanner: false,
         theme: CupertinoThemeData(
             primaryColor: AppColors.accent,
             scaffoldBackgroundColor: AppColors.bgBase),
+        // Clamp the system text scale. Android allows up to 200%, and the hour
+        // gutter plus a long event title overflowed the right edge at that size.
+        builder: (context, child) => MediaQuery.withClampedTextScaling(
+          minScaleFactor: 0.8,
+          maxScaleFactor: 1.2,
+          child: child ?? const SizedBox.shrink(),
+        ),
         home: CalendarPage(),
       );
 }
@@ -854,11 +861,19 @@ class _CalendarPageState extends State<CalendarPage> {
                   child: Row(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
-                      Text('${monthName(month)} $year',
-                          style: const TextStyle(
-                              fontSize: 17,
-                              fontWeight: FontWeight.w700,
-                              color: AppColors.textPrimary)),
+                      // Flexible + ellipsis: a long month name or a large text
+                      // scale must shrink or ellipsise rather than push the
+                      // chevrons off the edge, which is what "overflow to the
+                      // right" looks like.
+                      Flexible(
+                        child: Text('${monthName(month)} $year',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                                fontSize: 17,
+                                fontWeight: FontWeight.w700,
+                                color: AppColors.textPrimary)),
+                      ),
                       if (_loadingMonth) ...[
                         const SizedBox(width: 8),
                         const CupertinoActivityIndicator(radius: 8),
@@ -895,6 +910,10 @@ class _CalendarPageState extends State<CalendarPage> {
                 Expanded(
                   child: Text(
                       '${weekdayName(_selected.weekday)}, ${_selected.day} ${monthName(_selected.month)}',
+                      // A long weekday plus a large system text scale would clip
+                      // against the plus button; ellipsise instead of overflowing.
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                       style: const TextStyle(
                           fontSize: 17,
                           fontWeight: FontWeight.w700,
