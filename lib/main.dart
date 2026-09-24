@@ -6,10 +6,24 @@
 /// Cupertino-only: no Material widgets, pull-to-refresh via slivers.
 library;
 
+// ImageFilter comes from dart:ui; importing it explicitly is
+// unambiguous and costs nothing.
+import 'dart:ui' show ImageFilter;
+
 import 'package:flutter/cupertino.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'api_client.dart';
+
+/// Viewer mode: the apps are a window onto the plan, Hermes is the manager and
+/// Telegram is how the user talks to it. When true the app hides every editing
+/// surface (quick-add, editors, expense entry) so exactly one writer changes
+/// the data -- two writers disagreeing is how the list and the calendar drift
+/// apart. Flip it with --dart-define=VECTOR_READ_ONLY=false for an editable
+/// build; the default is viewer.
+const bool kReadOnly =
+    bool.fromEnvironment('VECTOR_READ_ONLY', defaultValue: true);
+
 
 void main() {
   // In release builds a widget whose build() throws is replaced by a
@@ -638,11 +652,14 @@ class _CalendarPageState extends State<CalendarPage> {
           onPressed: _goToday,
           child: const Text('Today'),
         ),
-        trailing: CupertinoButton(
-          padding: EdgeInsets.zero,
-          onPressed: () => _openEditor(date: _selected),
-          child: const Icon(CupertinoIcons.plus),
-        ),
+        // Viewer mode: no "+" -- Hermes creates events, the app shows them.
+        trailing: kReadOnly
+            ? null
+            : CupertinoButton(
+                padding: EdgeInsets.zero,
+                onPressed: () => _openEditor(date: _selected),
+                child: const Icon(CupertinoIcons.plus),
+              ),
       ),
       child: Container(
         decoration: const BoxDecoration(
@@ -919,11 +936,12 @@ class _CalendarPageState extends State<CalendarPage> {
                           fontWeight: FontWeight.w700,
                           color: AppColors.textPrimary)),
                 ),
-                CupertinoButton(
-                  padding: EdgeInsets.zero,
-                  onPressed: () => _openEditor(date: _selected),
-                  child: const Icon(CupertinoIcons.plus, size: 22),
-                ),
+                if (!kReadOnly)
+                  CupertinoButton(
+                    padding: EdgeInsets.zero,
+                    onPressed: () => _openEditor(date: _selected),
+                    child: const Icon(CupertinoIcons.plus, size: 22),
+                  ),
               ],
             ),
             const SizedBox(height: 4),
@@ -1110,7 +1128,9 @@ class _CalendarPageState extends State<CalendarPage> {
     final tint = done ? AppColors.textTertiary : _priColor(pri);
 
     return GestureDetector(
-      onTap: () => _openEditor(existing: item),
+      // Viewer mode: tapping shows nothing to edit. Marking work done stays on
+      // long-press -- completing is the user's call, editing is Hermes's.
+      onTap: kReadOnly ? null : () => _openEditor(existing: item),
       onLongPress: () => _itemActions(item),
       child: Container(
         decoration: BoxDecoration(
@@ -1159,7 +1179,7 @@ class _CalendarPageState extends State<CalendarPage> {
     final mins = itemMinutes(item);
     final loc = (item['location'] ?? '').toString();
     return GestureDetector(
-      onTap: () => _openEditor(existing: item),
+      onTap: kReadOnly ? null : () => _openEditor(existing: item),
       onLongPress: () => _itemActions(item),
       child: Container(
         decoration: BoxDecoration(
@@ -1263,19 +1283,33 @@ class _CalendarPageState extends State<CalendarPage> {
 
   // -- shared chrome ---------------------------------------------------------
 
-  Widget _glass({required Widget child}) => Container(
-        decoration: BoxDecoration(
-          color: AppColors.glass,
-          borderRadius: BorderRadius.circular(16),
-          border: Border.all(color: const Color(0x14000000)),
-          boxShadow: const [
-            BoxShadow(
-                color: Color(0x0D000000),
-                blurRadius: 18,
-                offset: Offset(0, 6)),
-          ],
+  /// Real Liquid Glass: a BackdropFilter blurs whatever is painted behind the
+  /// card, then a translucent two-stop white sits on top. A flat semi-opaque
+  /// white reads as "box", not "glass", because the backdrop shows through
+  /// unblurred.
+  Widget _glass({required Widget child}) => ClipRRect(
+        borderRadius: BorderRadius.circular(16),
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
+          child: Container(
+            decoration: BoxDecoration(
+              gradient: const LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [Color(0xE6FFFFFF), Color(0xB8FFFFFF)],
+              ),
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(color: const Color(0x33FFFFFF), width: 1),
+              boxShadow: const [
+                BoxShadow(
+                    color: Color(0x14000000),
+                    blurRadius: 24,
+                    offset: Offset(0, 8)),
+              ],
+            ),
+            child: child,
+          ),
         ),
-        child: child,
       );
 }
 
