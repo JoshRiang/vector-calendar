@@ -10,8 +10,9 @@ library;
 
 import 'dart:convert';
 import 'dart:async' show TimeoutException;
-import 'dart:io' show HandshakeException, HttpClient, SocketException;
-
+import 'dart:io' if (dart.library.js_interop) 'platform_web.dart'
+    show HttpClient, HandshakeException, SocketException;
+import 'platform_vm.dart' if (dart.library.js_interop) 'platform_web.dart' as platform;
 import 'package:http/http.dart' as http;
 
 class Api {
@@ -23,6 +24,7 @@ class Api {
   /// timeouts, it tries every candidate endpoint, and it never throws into the
   /// caller -- a failed diagnostic must not be a second failure.
   static void beacon(String stage, [String detail = '']) {
+    if (platform.kIsWeb) return; // dart:io HttpClient unavailable on web; the stub is a no-op
     Future<void>(() async {
       final bases = <String>[
         defaultBaseUrl,
