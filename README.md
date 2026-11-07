@@ -38,6 +38,21 @@ where t.status in ('todo','doing')
 
 If each app filtered independently, they could disagree — and the user would see work on the calendar that the tasks app says is not ready. One definition, one source of truth.
 
+<!-- SCREENSHOTS-AUTO:BEGIN -->
+## Screenshots
+
+Captured by CI (`.github/workflows/screenshots.yml`) with Playwright against a
+local stub API (`scripts/stub_api.py`) serving realistic November 2026 data.
+Viewport: 390×844, device scale 2×, CanvasKit renderer, Liquid Glass UI.
+
+| Screen | Description |
+|--------|-------------|
+| ![01-month-grid.png](screenshots/01-month-grid.png) | Month grid — November 2026, busy-day dots, today ring, selected day |
+| ![02-day-agenda.png](screenshots/02-day-agenda.png) | Day agenda — hour grid (05:00–24:00), timed event blocks, all-day strip |
+| ![03-inbox.png](screenshots/03-inbox.png) | Undated inbox — work without a scheduled time |
+| ![04-full-page.png](screenshots/04-full-page.png) | Full page — month grid, day agenda, and inbox in one view |
+<!-- SCREENSHOTS-AUTO:END -->
+
 ## Architecture
 
 ```
