@@ -22,8 +22,6 @@ jobs:
 
       - run: flutter test
 
-      - run: flutter create --platforms=web .
-
       - run: flutter build web --release \
           --dart-define=API_BASE=http://localhost:9473 \
           --dart-define=API_FALLBACKS= \
