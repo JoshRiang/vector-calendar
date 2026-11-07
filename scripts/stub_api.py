@@ -209,7 +209,12 @@ def _goals_payload():
 
 # ── Request counters (let the screenshot script confirm the app reached us) ──
 
-STATS = {"calendar_range": 0}
+STATS = {}
+
+
+def _bump(key):
+    """Increment a per-endpoint hit counter (read via GET /__stats)."""
+    STATS[key] = STATS.get(key, 0) + 1
 
 
 # ── HTTP server ────────────────────────────────────────────────────────────────
@@ -218,16 +223,31 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # quiet in CI
 
+    def _cors(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods",
+                         "GET, POST, PATCH, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers",
+                         "Content-Type, X-User-Id, X-Api-Key")
+
     def _respond(self, code, obj):
         body = json.dumps(obj, default=str).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._cors()
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
     def do_OPTIONS(self):
-        self._respond(204, {})
+        # Preflight for the app's custom X-User-Id / X-Api-Key headers. Without
+        # an explicit Access-Control-Allow-Headers the browser blocks the real
+        # cross-origin request, and the app renders its offline screen instead
+        # of calendar data.
+        self.send_response(204)
+        self._cors()
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_POST(self):
         self._respond(200, {})  # generic no-op for POST /diag, /tasks, etc.
@@ -248,12 +268,16 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/__stats":
             self._respond(200, {"stats": STATS})
         elif path == "/calendar/range":
+            _bump("calendar_range")
             self._respond(200, _range_payload(qs))
         elif path == "/today":
+            _bump("today")
             self._respond(200, _today_payload())
         elif path == "/tasks/startable":
+            _bump("startable")
             self._respond(200, _startable_payload())
         elif path == "/goals":
+            _bump("goals")
             self._respond(200, _goals_payload())
         elif path == "/commands":
             self._respond(200, [])

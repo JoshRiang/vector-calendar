@@ -52,16 +52,48 @@ function waitForUrl(url, timeoutMs = 20000) {
 }
 
 async function waitForFlutterBoot(page) {
+  // Flutter web mounts its <canvas> INSIDE <flutter-view>'s shadow root, so a
+  // plain document.querySelector('canvas') finds nothing. Walk shadow roots.
   const start = Date.now();
   while (Date.now() - start < BOOT_TIMEOUT_MS) {
     const ready = await page.evaluate(() => {
-      const c = document.querySelector('canvas');
+      function findCanvas(root) {
+        if (!root) return null;
+        if (root.querySelector) {
+          const c = root.querySelector('canvas');
+          if (c) return c;
+        }
+        const els = root.querySelectorAll ? Array.from(root.querySelectorAll('*')) : [];
+        for (const el of els) {
+          if (el.shadowRoot) {
+            const found = findCanvas(el.shadowRoot);
+            if (found) return found;
+          }
+        }
+        return null;
+      }
+      const c = findCanvas(document);
       return !!(c && c.width > 0 && c.height > 0);
     });
     if (ready) return;
     await sleep(250);
   }
   throw new Error(`Flutter did not boot within ${BOOT_TIMEOUT_MS}ms`);
+}
+
+// Wait until the app has actually fetched its calendar month data (via the
+// stub's /__stats hit counter) before snapping screenshots.
+async function waitForAppData(timeoutMs = 20000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const res = await fetch(API_URL + '/__stats');
+      const j = await res.json();
+      if (j && j.stats && j.stats.calendar_range > 0) return true;
+    } catch (e) { /* stub still warming up — retry */ }
+    await sleep(300);
+  }
+  return false;
 }
 
 async function shoot(page, filename) {
@@ -118,6 +150,7 @@ async function main() {
   web.stdout.on('data', d => process.stdout.write(`[web] ${d}`));
   web.stderr.on('data', d => process.stderr.write(`[web] ${d}`));
 
+  let page = null;
   try {
     await Promise.all([waitForUrl(API_URL + '/diag'), waitForUrl(APP_URL + '/index.html')]);
     console.log('→ Both servers up.');
@@ -130,7 +163,7 @@ async function main() {
       hasTouch: true,
       colorScheme: 'light',
     });
-    const page = await context.newPage();
+    page = await context.newPage();
 
     console.log('→ Opening app...');
     await page.goto(APP_URL, { waitUntil: 'load', timeout: 60000 });
@@ -139,13 +172,16 @@ async function main() {
     await waitForFlutterBoot(page);
     console.log('  Flutter is up.');
 
-    console.log(`→ Waiting ${DATA_WAIT_MS / 1000}s for data + render...`);
-    await sleep(DATA_WAIT_MS);
-
-    // Sanity: confirm the app did not land on its error screen.
-    // In a canvas app we cannot inspect the DOM for error text, but the
-    // error screen is short; the full page height gives a rough signal.
-    // We proceed regardless and rely on the screenshot review.
+    // Confirm the app actually fetched data (the stub counts hits), then
+    // give CanvasKit a moment to repaint before screenshotting.
+    console.log('→ Waiting for app data from stub (≤20s)...');
+    const gotData = await waitForAppData();
+    if (!gotData) {
+      console.log('  ⚠ /__stats reported no data yet — proceeding after a settle delay.');
+    } else {
+      console.log('  ✓ App fetched calendar data.');
+    }
+    await sleep(1500);
 
     for (const shot of SHOTS) {
       if (typeof shot.scrollY === 'number') {

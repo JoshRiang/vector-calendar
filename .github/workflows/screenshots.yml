@@ -5,6 +5,12 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+# The job pushes the screenshots back to main, so the token needs write access
+# to repository contents. The default is read-only and the push would be
+# rejected at the last step.
+permissions:
+  contents: write
+
 jobs:
   screenshots:
     runs-on: ubuntu-latest
@@ -17,19 +23,30 @@ jobs:
           channel: 'stable'
 
       - run: flutter --version
-
       - run: flutter pub get
-
       - run: flutter test
 
-      - run: flutter build web --release \
-          --dart-define=API_BASE=http://localhost:9473 \
-          --dart-define=API_FALLBACKS= \
-          --dart-define=VECTOR_READ_ONLY=false
+      # Block scalar, not a folded one: the backslash continuations below are
+      # bash line-continuations and must survive into the shell.
+      # API_FALLBACKS is forced EMPTY on purpose -- the compiled-in defaults are
+      # Tailscale/LAN addresses that are unroutable from a runner and would hang
+      # every request until its connect timeout.
+      - name: Build Flutter web (release)
+        run: |
+          flutter build web --release \
+            --dart-define=API_BASE=http://localhost:9473 \
+            --dart-define=API_FALLBACKS= \
+            --dart-define=VECTOR_READ_ONLY=false
 
-      - run: npm init -y
-      - run: npm install playwright
-      - run: npx playwright install --with-deps chromium
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Playwright + Chromium
+        run: |
+          npm init -y >/dev/null
+          npm install playwright
+          npx playwright install --with-deps chromium
 
       - name: Shoot screenshots
         run: node scripts/shoot.js
@@ -40,8 +57,10 @@ jobs:
           git config user.email 'sandinya1sampai8@gmail.com'
           git add screenshots/ README.md
           if git diff --cached --quiet; then
-            echo "No changes to commit"
+            echo "No screenshot changes -- nothing to push."
           else
-            git commit -m "chore: update screenshots + README"
+            # [skip ci] keeps this push from re-triggering the workflow, which
+            # is the loop guard; the diff check above is the second one.
+            git commit -m "chore: update screenshots + README [skip ci]"
             git push origin HEAD:main
           fi
